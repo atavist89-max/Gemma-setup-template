@@ -81,10 +81,12 @@ class MainActivity : ComponentActivity() {
                         status = Status.TESTING
                         message = "Testing connection..."
                         
-                        val result = testConnection()
+                        val (success, errorMsg) = testConnection()
                         
-                        status = if (result) Status.CONNECTED else Status.FAILED
-                        message = if (result) "Connected to Gemma 4 E2B!" else "Connection failed"
+                        status = if (success) Status.CONNECTED else Status.FAILED
+                        message = errorMsg
+                        
+                        showToast(if (success) "Connected!" else errorMsg.take(100))
                     }
                 },
                 enabled = status != Status.TESTING
@@ -94,54 +96,61 @@ class MainActivity : ComponentActivity() {
         }
     }
     
-    private suspend fun testConnection(): Boolean = withContext(Dispatchers.IO) {
+    private suspend fun testConnection(): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         try {
             val modelFile = File("/storage/emulated/0/Download/GhostModels/gemma-4-e2b.litertlm")
             
             if (!modelFile.exists()) {
-                showToast("Model file not found!")
-                return@withContext false
+                return@withContext Pair(false, "Model file not found at ${modelFile.absolutePath}")
+            }
+            
+            // Check file size
+            val fileSizeMB = modelFile.length() / (1024 * 1024)
+            if (fileSizeMB < 1000) {
+                return@withContext Pair(false, "Model file too small (${fileSizeMB}MB), may be corrupted")
             }
             
             // Try GPU first
-            val config = EngineConfig(
-                modelPath = modelFile.absolutePath,
-                backend = Backend.GPU(),
-                maxNumTokens = 1024,
-                cacheDir = cacheDir.path
-            )
-            
-            val testEngine = Engine(config)
-            testEngine.initialize()
-            
-            // Test successful - clean up
-            testEngine.close()
-            
-            showToast("GPU Backend: Connected")
-            true
-            
-        } catch (e: Exception) {
-            // Try CPU fallback
             try {
-                val modelFile = File("/storage/emulated/0/Download/GhostModels/gemma-4-e2b.litertlm")
-                val cpuConfig = EngineConfig(
+                val config = EngineConfig(
                     modelPath = modelFile.absolutePath,
-                    backend = Backend.CPU(),
+                    backend = Backend.GPU(),
                     maxNumTokens = 1024,
                     cacheDir = cacheDir.path
                 )
                 
-                val cpuEngine = Engine(cpuConfig)
-                cpuEngine.initialize()
-                cpuEngine.close()
+                val testEngine = Engine(config)
+                testEngine.initialize()
+                testEngine.close()
                 
-                showToast("CPU Backend: Connected")
-                true
+                return@withContext Pair(true, "GPU Backend Connected (${fileSizeMB}MB model)")
                 
-            } catch (e2: Exception) {
-                showToast("Both GPU and CPU failed")
-                false
+            } catch (gpuError: Exception) {
+                // GPU failed, try CPU
+                try {
+                    val cpuConfig = EngineConfig(
+                        modelPath = modelFile.absolutePath,
+                        backend = Backend.CPU(),
+                        maxNumTokens = 1024,
+                        cacheDir = cacheDir.path
+                    )
+                    
+                    val cpuEngine = Engine(cpuConfig)
+                    cpuEngine.initialize()
+                    cpuEngine.close()
+                    
+                    return@withContext Pair(true, "CPU Backend Connected (GPU failed: ${gpuError.message})")
+                    
+                } catch (cpuError: Exception) {
+                    return@withContext Pair(false, 
+                        "GPU: ${gpuError.javaClass.simpleName}: ${gpuError.message}\n" +
+                        "CPU: ${cpuError.javaClass.simpleName}: ${cpuError.message}"
+                    )
+                }
             }
+            
+        } catch (e: Exception) {
+            return@withContext Pair(false, "Unexpected error: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
     
