@@ -1,8 +1,8 @@
-# ACIS — On-Device Gemma 4 E2B Reference Project
+# Gemma-setup-template — On-Device Gemma 4 E2B Reference Project
 
 > **Purpose:** This repository is a reference implementation for future Android projects that need on-device inference with **Gemma 4 E2B** via Google's [LiteRT-LM](https://ai.google.dev/edge/litert/models/litert_lm) engine, combined with large local data sources (SQLite databases, streaming JSON). Use this as the canonical guide for setup, file access patterns, permissions, and known hardware constraints.
 
-![Build](https://github.com/atavist89-max/ACIS/actions/workflows/build.yml/badge.svg)
+![Build](https://github.com/atavist89-max/Gemma-setup-template/actions/workflows/build.yml/badge.svg)
 
 ---
 
