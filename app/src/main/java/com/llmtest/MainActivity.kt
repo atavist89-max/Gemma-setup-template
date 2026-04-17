@@ -142,7 +142,7 @@ class MainActivity : ComponentActivity() {
     }
     
     private suspend fun querySanctionsForEntity(entityId: String): List<String> = withContext(Dispatchers.IO) {
-        BugLogger.log("Querying sanctions for entity: $entityId")
+        BugLogger.log("Querying sanctions_entities for: $entityId")
         val matches = mutableListOf<String>()
 
         if (!GhostPaths.isSanctionsDbAvailable()) {
@@ -157,62 +157,61 @@ class MainActivity : ComponentActivity() {
         )
 
         try {
-            // METHOD 1: Try to find by entity ID in regular entities table
-            BugLogger.log("Trying entity ID lookup...")
+            // Query the REGULAR table (not FTS5 virtual table)
+            BugLogger.log("Querying sanctions_entities table...")
             val cursor = db.rawQuery(
-                "SELECT id, caption, schema, target FROM entities WHERE id = ? LIMIT 1",
+                "SELECT entity_id, canonical_name, schema_type, countries, programs, topics " +
+                "FROM sanctions_entities WHERE entity_id = ? LIMIT 1",
                 arrayOf(entityId)
             )
 
             if (cursor.moveToFirst()) {
                 val id = cursor.getString(0)
-                val caption = cursor.getString(1)
-                val schema = cursor.getString(2)
-                val target = cursor.getInt(3)
-                val targetStr = if (target == 1) "SANCTIONED" else "Not sanctioned"
-                matches.add("Entity: $caption | Type: $schema | Status: $targetStr")
-                BugLogger.log("Found entity in DB: $caption")
+                val name = cursor.getString(1) ?: "Unknown"
+                val schema = cursor.getString(2) ?: "Unknown"
+                val countries = cursor.getString(3) ?: "N/A"
+                val programs = cursor.getString(4) ?: "None"
+                val topics = cursor.getString(5) ?: ""
+
+                val isSanctioned = topics.contains("sanction") || programs.isNotBlank()
+                val status = if (isSanctioned) "🚨 SANCTIONED" else "Not sanctioned"
+
+                matches.add("Name: $name")
+                matches.add("Type: $schema")
+                matches.add("Status: $status")
+                matches.add("Programs: $programs")
+                matches.add("Countries: $countries")
+                if (topics.isNotBlank()) matches.add("Topics: $topics")
+
+                BugLogger.log("Found: $name ($status)")
+            } else {
+                BugLogger.log("No match found in sanctions_entities")
             }
             cursor.close()
 
-            // METHOD 2: Search by caption using LIKE (avoid FTS5)
+            // Also try partial match on canonical_name if no exact ID match
             if (matches.isEmpty() && selectedEntity != null) {
-                val caption = selectedEntity!!.second
-                BugLogger.log("Searching by caption LIKE: $caption")
+                val searchName = selectedEntity!!.second.take(30) // First 30 chars
+                BugLogger.log("Trying partial name match: $searchName")
 
-                // Use substring search with LIKE (slower but no FTS5 required)
-                val searchTerm = "%${caption.take(20)}%" // First 20 chars
-                val likeCursor = db.rawQuery(
-                    "SELECT id, caption, schema, target FROM entities WHERE caption LIKE ? LIMIT 10",
-                    arrayOf(searchTerm)
+                val nameCursor = db.rawQuery(
+                    "SELECT entity_id, canonical_name, schema_type, programs, topics " +
+                    "FROM sanctions_entities WHERE canonical_name LIKE ? LIMIT 5",
+                    arrayOf("%$searchName%")
                 )
 
-                while (likeCursor.moveToNext()) {
-                    val id = likeCursor.getString(0)
-                    val cap = likeCursor.getString(1)
-                    val schema = likeCursor.getString(2)
-                    val target = likeCursor.getInt(3)
-                    val targetStr = if (target == 1) "SANCTIONED" else "Not sanctioned"
-                    matches.add("Match: $cap | Type: $schema | Status: $targetStr")
-                    BugLogger.log("Found match: $cap")
-                }
-                likeCursor.close()
-            }
+                while (nameCursor.moveToNext()) {
+                    val id = nameCursor.getString(0)
+                    val name = nameCursor.getString(1)
+                    val schema = nameCursor.getString(2)
+                    val programs = nameCursor.getString(3)
+                    val topics = nameCursor.getString(4)
+                    val isSanctioned = topics.contains("sanction") || programs.isNotBlank()
+                    val status = if (isSanctioned) "🚨 SANCTIONED" else "OK"
 
-            // METHOD 3: Check if entity has any relationships/associations
-            if (matches.isNotEmpty()) {
-                BugLogger.log("Checking for sanctions programs...")
-                // Look for program info in the entity properties or related tables
-                val propCursor = db.rawQuery(
-                    "SELECT key, value FROM entity_properties WHERE entity_id = ? AND key LIKE '%program%'",
-                    arrayOf(entityId)
-                )
-                while (propCursor.moveToNext()) {
-                    val key = propCursor.getString(0)
-                    val value = propCursor.getString(1)
-                    matches.add("Program: $value")
+                    matches.add("Similar: $name ($schema) - $status")
                 }
-                propCursor.close()
+                nameCursor.close()
             }
 
         } catch (e: Exception) {
@@ -221,7 +220,7 @@ class MainActivity : ComponentActivity() {
             db.close()
         }
 
-        BugLogger.log("Total matches found: ${matches.size}")
+        BugLogger.log("Total matches: ${matches.size}")
         matches
     }
     
