@@ -1,20 +1,16 @@
-# ACIS — Sanctions Screening App
+# ACIS — On-Device Gemma 4 E2B Reference Project
 
-An Android app for on-device sanctions screening using **Gemma 4 E2B** via Google's [LiteRT-LM](https://ai.google.dev/edge/litert/models/litert_lm) engine. It queries a local OpenSanctions database and entities dataset, then uses the LLM to generate factual, data-only risk assessments.
+> **Purpose:** This repository is a reference implementation for future Android projects that need on-device inference with **Gemma 4 E2B** via Google's [LiteRT-LM](https://ai.google.dev/edge/litert/models/litert_lm) engine, combined with large local data sources (SQLite databases, streaming JSON). Use this as the canonical guide for setup, file access patterns, permissions, and known hardware constraints.
 
 ![Build](https://github.com/atavist89-max/ACIS/actions/workflows/build.yml/badge.svg)
 
-## What it does
+---
 
-- Loads a list of entities (`Person` / `Company`) from a local `entities.ftm.json` file.
-- Lets you select an entity from a dropdown (first 100 shown).
-- Retrieves the full entity record and queries a local SQLite sanctions database (`opensanctions.sqlite`).
-- Sends the entity data + sanctions matches to the on-device LLM with strict instructions to analyze **only the provided data**.
-- Displays a concise, factual risk assessment.
+## 1. On-Device File Storage & Access
 
-## Data Requirements
+### 1.1 Required Files on Device
 
-Place the following files on device:
+Place the following files in the exact paths below. The app uses hard-coded absolute paths (see `GhostPaths.kt`).
 
 ```
 /storage/emulated/0/Download/GhostModels/gemma-4-e2b.litertlm
@@ -22,83 +18,237 @@ Place the following files on device:
 /storage/emulated/0/Download/GhostModels/CounterpartyProject/sanctions_data/entities.ftm.json
 ```
 
-The app verifies each file exists and meets minimum size checks before use.
+| File | Purpose | Min Size Check |
+|------|---------|----------------|
+| `gemma-4-e2b.litertlm` | On-device LLM model | `> 1 GB` |
+| `opensanctions.sqlite` | Local SQLite sanctions database | `> 10 MB` |
+| `entities.ftm.json` | Streaming NDJSON entity records | exists |
 
-## System Requirements
+### 1.2 How Files Are Accessed in Code
 
-- **Android device** running API 36+ (Android 16+).
-- **JDK 21** to build (required by `litertlm-android:0.10.0`).
-- **Android SDK 36**.
-- **Storage permission** (`All files access` on Android 11+) so the app can read the model and data files from external storage.
+All paths are centralized in **`GhostPaths.kt`**:
 
-## Tech Stack
+```kotlin
+object GhostPaths {
+    val BASE_DIR = File("/storage/emulated/0/Download/GhostModels")
+    val MODEL_FILE = File(BASE_DIR, "gemma-4-e2b.litertlm")
+    val SANCTIONS_DB = File(BASE_DIR, "CounterpartyProject/sanctions_data/opensanctions.sqlite")
+    val ENTITIES_JSON = File(BASE_DIR, "CounterpartyProject/sanctions_data/entities.ftm.json")
 
-- **Language:** Kotlin 2.1.20
-- **UI:** Jetpack Compose (Material 3)
-- **Inference Engine:** `com.google.ai.edge.litertlm:litertlm-android:0.10.0`
-- **Local Database:** SQLite (Android built-in)
-- **Build:** Gradle 8.6, Android Gradle Plugin 8.3.0
+    fun isModelAvailable(): Boolean = MODEL_FILE.exists() && MODEL_FILE.length() > 1_000_000_000L
+    fun isSanctionsDbAvailable(): Boolean = SANCTIONS_DB.exists() && SANCTIONS_DB.length() > 10_000_000L
+    fun isEntitiesJsonAvailable(): Boolean = ENTITIES_JSON.exists()
+}
+```
 
-## Build
+**Key access patterns:**
+- **Model:** Passed as `modelPath = MODEL_FILE.absolutePath` to `EngineConfig`.
+- **SQLite:** Opened via `SQLiteDatabase.openDatabase(GhostPaths.SANCTIONS_DB.absolutePath, null, SQLiteDatabase.OPEN_READONLY)`.
+- **NDJSON entities:** Streamed line-by-line with `BufferedReader(FileReader(GhostPaths.ENTITIES_JSON))` — **never load the full 2.6 GB file into memory**.
+
+### 1.3 Temporary / Cache Data (Optional Test Flows)
+
+Some test functions (e.g. SEC filing chunk analysis) read from:
+
+```
+/storage/emulated/0/Download/GhostModels/ACIS_cache/
+```
+
+Chunks are expected as files named `chunk_*` (created via `split -b 6000`).
+
+---
+
+## 2. Mandatory Permissions
+
+### 2.1 Android Manifest
+
+```xml
+<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+```
+
+> **Note:** `READ_EXTERNAL_STORAGE` is **insufficient** on Android 11+ (API 30+) because the model and data live outside app-scoped directories.
+
+### 2.2 Runtime Permission Check (Android 11+)
+
+Use `Environment.isExternalStorageManager()`:
+
+```kotlin
+private fun hasStoragePermission(): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Environment.isExternalStorageManager()
+    } else {
+        true
+    }
+}
+```
+
+### 2.3 Requesting Permission
+
+Redirect the user to system settings because `MANAGE_EXTERNAL_STORAGE` cannot be granted via a normal runtime dialog:
+
+```kotlin
+private fun requestStoragePermission() {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+            data = Uri.parse("package:$packageName")
+        }
+        startActivity(intent)
+    }
+}
+```
+
+### 2.4 Lifecycle-Aware Re-Check
+
+Re-check permission in `ON_RESUME` so the UI updates automatically when the user returns from settings:
+
+```kotlin
+val observer = LifecycleEventObserver { _, event ->
+    if (event == Lifecycle.Event.ON_RESUME) {
+        hasPermission = hasStoragePermission()
+    }
+}
+lifecycle.addObserver(observer)
+```
+
+---
+
+## 3. LiteRT-LM Engine Setup (Gemma 4 E2B)
+
+### 3.1 Dependency
+
+```kotlin
+// app/build.gradle
+implementation("com.google.ai.edge.litertlm:litertlm-android:0.10.0")
+```
+
+### 3.2 Engine Initialization
+
+Initialize **once** and reuse. The engine is **not thread-safe**.
+
+```kotlin
+val config = EngineConfig(
+    modelPath = GhostPaths.MODEL_FILE.absolutePath,
+    backend = Backend.GPU(),        // Falls back to CPU if GPU unavailable
+    maxNumTokens = 2048,            // See Section 4 for hard limits
+    cacheDir = cacheDir.path
+)
+val engine = Engine(config)
+engine.initialize()
+```
+
+### 3.3 Inference Call
+
+Always run on a background thread (`Dispatchers.IO`). Use a single `Conversation` per call:
+
+```kotlin
+val conversation = engine.createConversation(
+    ConversationConfig(
+        samplerConfig = SamplerConfig(
+            temperature = 0.5,
+            topK = 40,
+            topP = 0.9
+        )
+    )
+)
+conversation.use {
+    val response = it.sendMessage(Message.of(prompt))
+    val text = response.toString()
+}
+```
+
+### 3.4 Cleanup
+
+Close the engine in `onDestroy()`:
+
+```kotlin
+override fun onDestroy() {
+    super.onDestroy()
+    engine?.close()
+}
+```
+
+---
+
+## 4. Technical Constraints (Verified by Testing)
+
+### 4.1 LLM Context Window
+
+| Specification | Reality |
+|---------------|---------|
+| Advertised: 128K tokens | **Actual: ~2,500 tokens hard limit** |
+| Practical safe limit | **2,000 tokens** |
+| Failure mode | Any prompt > 2,500 tokens crashes with `INVALID_ARGUMENT` |
+
+**Implication:** All analysis inputs must be chunked to **< 2,000 tokens** to leave headroom for prompt-template overhead.
+
+### 4.2 Verified Chunking Strategy
+
+| Data Source | Chunk Size |
+|-------------|------------|
+| SEC Filing chunks | 4,000 bytes (~1,000 tokens) + prompt overhead = ~1,500 total |
+| Entity JSON | Load full record if < 4,000 chars; truncate if larger |
+| Max chunks per analysis | 10–20 (battery/heat constraints) |
+
+### 4.3 Processing Architecture
+
+- **Concurrency: NONE.** The LiteRT-LM Engine is single-threaded. Parallel inference attempts crash with `LiteRtLmJniException`.
+- **Pattern:** Sequential pipeline with a **10-second cooldown** between LLM calls.
+- **State Management:** Pass a shared state object between agents; do not access it concurrently.
+
+### 4.4 Battery & Thermal Constraints
+
+| Metric | Value |
+|--------|-------|
+| Per inference cost | 2–3% battery, 1–3 seconds |
+| Maximum sustained | 3–4 inferences before GPU throttling |
+| Cooldown between calls | 10 seconds |
+| Extended cooldown (warm device) | 2 minutes |
+
+### 4.5 Memory Constraints
+
+| Metric | Value |
+|--------|-------|
+| Model loading overhead | +2.5 GB RAM when Engine initializes |
+| Large JSON (entities) | **Stream** the 2.6 GB file; never load fully |
+| Safe headroom | Maintain > 2 GB available RAM |
+
+---
+
+## 5. Project Structure
+
+```
+app/src/main/java/com/llmtest/
+├── BugLogger.kt      # File-based timestamped logger (+ View Logs / Copy Logs)
+├── EntityData.kt     # Entity data class
+├── GhostPaths.kt     # Hard-coded absolute paths to model + data
+└── MainActivity.kt   # UI (Jetpack Compose), DB queries, LLM inference, tests
+
+app/src/main/AndroidManifest.xml   # MANAGE_EXTERNAL_STORAGE + native libs
+app/build.gradle                    # Dependencies (litertlm-android:0.10.0)
+```
+
+---
+
+## 6. Build & Install
+
+**Requirements:**
+- Android device running **API 36+ (Android 16+)**
+- **JDK 21**
+- **Android SDK 36**
 
 ```bash
 ./gradlew assembleDebug
-```
-
-APK output:
-```
-app/build/outputs/apk/debug/app-debug.apk
-```
-
-## Install & Run
-
-```bash
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Launch the app, grant storage permission if prompted, then:
-1. Select an entity from the dropdown.
-2. Tap **Screen Entity**.
-3. Wait for the analysis to complete.
+---
 
-| Status Light | Meaning |
-|--------------|---------|
-| Gray         | Idle / waiting for selection |
-| Yellow       | Loading data / querying DB / running LLM |
-| Green        | Analysis complete |
-| Red          | Error occurred |
+## 7. CI
 
-## LLM Configuration
+GitHub Actions (`.github/workflows/build.yml`) builds the debug APK on every push and PR to `main`.
 
-- **Temperature:** `0.5` (factual, deterministic output)
-- **Top-K:** `40`
-- **Top-P:** `0.9`
-- **Backend:** GPU (falls back to CPU if unavailable)
-- **Max tokens:** `2048`
+---
 
-The prompt explicitly instructs the model not to use external knowledge and to base the entire analysis strictly on the provided local data.
+## 8. License
 
-## Debugging
-
-Tap **View Logs** in the app to see a timestamped event log, or use Android Studio / `adb logcat` with the `BugLogger` tag. All major operations (permission checks, file loading, DB queries, LLM initialization, and inference) are logged.
-
-## Project Structure
-
-```
-app/src/main/java/com/llmtest/BugLogger.kt      # Internal file-based logger
-app/src/main/java/com/llmtest/EntityData.kt     # Entity data class
-app/src/main/java/com/llmtest/GhostPaths.kt     # Paths to model + data files
-app/src/main/java/com/llmtest/MainActivity.kt   # UI + screening logic
-app/src/main/AndroidManifest.xml                # Permissions & native libs
-app/build.gradle                                # App module build config
-build.gradle                                    # Root project plugins
-settings.gradle                                 # Repositories & modules
-```
-
-## CI
-
-A GitHub Actions workflow (`.github/workflows/build.yml`) builds the debug APK on every push and pull request to `main`.
-
-## License
-
-This is a personal test / debugging project. No production warranty implied.
+Personal test / debugging project. No production warranty implied.
