@@ -1,5 +1,8 @@
 package com.llmtest
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -681,6 +684,19 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.weight(1f)
                     ) {
                         Text("View Logs")
+                    }
+                    
+                    Button(
+                        onClick = {
+                            val logs = BugLogger.readLog()
+                            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            val clip = ClipData.newPlainText("ACIS Logs", logs)
+                            clipboard.setPrimaryClip(clip)
+                            Toast.makeText(this@MainActivity, "Logs copied to clipboard", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Copy Logs")
                     }
                     
                     Button(
