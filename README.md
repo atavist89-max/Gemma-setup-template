@@ -1,30 +1,26 @@
 # Gemma-setup-template — On-Device Gemma 4 E2B Reference Project
 
-> **Purpose:** This repository is a reference implementation for future Android projects that need on-device inference with **Gemma 4 E2B** via Google's [LiteRT-LM](https://ai.google.dev/edge/litert/models/litert_lm) engine, combined with large local data sources (SQLite databases, streaming JSON). Use this as the canonical guide for setup, file access patterns, permissions, and known hardware constraints.
+> **Purpose:** This repository is a reference implementation for future Android projects that need on-device inference with **Gemma 4 E2B** via Google's [LiteRT-LM](https://ai.google.dev/edge/litert/models/litert_lm) engine. Use this as the canonical guide for model setup, file access patterns, permissions, and known hardware constraints.
 
 ![Build](https://github.com/atavist89-max/Gemma-setup-template/actions/workflows/build.yml/badge.svg)
 
 ---
 
-## 1. On-Device File Storage & Access
+## 1. On-Device Model Storage & Access
 
-### 1.1 Required Files on Device
+### 1.1 Required File on Device
 
-Place the following files in the exact paths below. The app uses hard-coded absolute paths (see `GhostPaths.kt`).
+Place the model file in the exact path below. The app uses a hard-coded absolute path (see `GhostPaths.kt`).
 
 ```
 /storage/emulated/0/Download/GhostModels/gemma-4-e2b.litertlm
-/storage/emulated/0/Download/GhostModels/CounterpartyProject/sanctions_data/opensanctions.sqlite
-/storage/emulated/0/Download/GhostModels/CounterpartyProject/sanctions_data/entities.ftm.json
 ```
 
 | File | Purpose | Min Size Check |
 |------|---------|----------------|
-| `gemma-4-e2b.litertlm` | On-device LLM model | `> 1 GB` |
-| `opensanctions.sqlite` | Local SQLite sanctions database | `> 10 MB` |
-| `entities.ftm.json` | Streaming NDJSON entity records | exists |
+| `gemma-4-e2b.litertlm` | On-device LLM model | `> 2 GB` |
 
-### 1.2 How Files Are Accessed in Code
+### 1.2 How the Model Is Accessed in Code
 
 All paths are centralized in **`GhostPaths.kt`**:
 
@@ -32,29 +28,13 @@ All paths are centralized in **`GhostPaths.kt`**:
 object GhostPaths {
     val BASE_DIR = File("/storage/emulated/0/Download/GhostModels")
     val MODEL_FILE = File(BASE_DIR, "gemma-4-e2b.litertlm")
-    val SANCTIONS_DB = File(BASE_DIR, "CounterpartyProject/sanctions_data/opensanctions.sqlite")
-    val ENTITIES_JSON = File(BASE_DIR, "CounterpartyProject/sanctions_data/entities.ftm.json")
 
     fun isModelAvailable(): Boolean = MODEL_FILE.exists() && MODEL_FILE.length() > 1_000_000_000L
-    fun isSanctionsDbAvailable(): Boolean = SANCTIONS_DB.exists() && SANCTIONS_DB.length() > 10_000_000L
-    fun isEntitiesJsonAvailable(): Boolean = ENTITIES_JSON.exists()
 }
 ```
 
-**Key access patterns:**
+**Key access pattern:**
 - **Model:** Passed as `modelPath = MODEL_FILE.absolutePath` to `EngineConfig`.
-- **SQLite:** Opened via `SQLiteDatabase.openDatabase(GhostPaths.SANCTIONS_DB.absolutePath, null, SQLiteDatabase.OPEN_READONLY)`.
-- **NDJSON entities:** Streamed line-by-line with `BufferedReader(FileReader(GhostPaths.ENTITIES_JSON))` — **never load the full 2.6 GB file into memory**.
-
-### 1.3 Temporary / Cache Data (Optional Test Flows)
-
-Some test functions (e.g. SEC filing chunk analysis) read from:
-
-```
-/storage/emulated/0/Download/GhostModels/ACIS_cache/
-```
-
-Chunks are expected as files named `chunk_*` (created via `split -b 6000`).
 
 ---
 
@@ -66,7 +46,7 @@ Chunks are expected as files named `chunk_*` (created via `split -b 6000`).
 <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 ```
 
-> **Note:** `READ_EXTERNAL_STORAGE` is **insufficient** on Android 11+ (API 30+) because the model and data live outside app-scoped directories.
+> **Note:** `READ_EXTERNAL_STORAGE` is **insufficient** on Android 11+ (API 30+) because the model lives outside app-scoped directories.
 
 ### 2.2 Runtime Permission Check (Android 11+)
 
@@ -179,15 +159,15 @@ override fun onDestroy() {
 | Practical safe limit | **2,000 tokens** |
 | Failure mode | Any prompt > 2,500 tokens crashes with `INVALID_ARGUMENT` |
 
-**Implication:** All analysis inputs must be chunked to **< 2,000 tokens** to leave headroom for prompt-template overhead.
+**Implication:** All prompts must be chunked to **< 2,000 tokens** to leave headroom for prompt-template overhead.
 
 ### 4.2 Verified Chunking Strategy
 
-| Data Source | Chunk Size |
-|-------------|------------|
-| SEC Filing chunks | 4,000 bytes (~1,000 tokens) + prompt overhead = ~1,500 total |
-| Entity JSON | Load full record if < 4,000 chars; truncate if larger |
-| Max chunks per analysis | 10–20 (battery/heat constraints) |
+| Input Type | Guideline |
+|------------|-----------|
+| Free-text prompts | Keep under ~1,500 tokens to leave room for the response |
+| Pre-processed context | Chunk to < 2,000 tokens per inference call |
+| Max sequential calls | 10–20 (battery/heat constraints) |
 
 ### 4.3 Processing Architecture
 
@@ -209,7 +189,6 @@ override fun onDestroy() {
 | Metric | Value |
 |--------|-------|
 | Model loading overhead | +2.5 GB RAM when Engine initializes |
-| Large JSON (entities) | **Stream** the 2.6 GB file; never load fully |
 | Safe headroom | Maintain > 2 GB available RAM |
 
 ---
@@ -219,9 +198,8 @@ override fun onDestroy() {
 ```
 app/src/main/java/com/llmtest/
 ├── BugLogger.kt      # File-based timestamped logger (+ View Logs / Copy Logs)
-├── EntityData.kt     # Entity data class
-├── GhostPaths.kt     # Hard-coded absolute paths to model + data
-└── MainActivity.kt   # UI (Jetpack Compose), DB queries, LLM inference, tests
+├── GhostPaths.kt     # Hard-coded absolute path to the model
+└── MainActivity.kt   # UI (Jetpack Compose), LLM inference, tests
 
 app/src/main/AndroidManifest.xml   # MANAGE_EXTERNAL_STORAGE + native libs
 app/build.gradle                    # Dependencies (litertlm-android:0.10.0)
